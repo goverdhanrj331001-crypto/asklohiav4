@@ -1,0 +1,40 @@
+# ── Build & Cache ──────────────────────────────────────────
+node_modules/
+.next/
+coverage/
+tsconfig.tsbuildinfo
+
+# ── OS Files ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+
+# ── Environment (KABHI commit mat karo) ───────────────────
+.env
+.env.local
+.env.production
+.env.development
+
+# ── Sensitive Credentials (KABHI commit mat karo) ─────────
+# Service Account JSON files — SECURITY RISK
+*-credentials.json
+*-service-account.json
+collegechatbot-*.json
+firebase-*.json
+
+# ── Allow specific JSON files ─────────────────────────────
+!package.json
+!package-lock.json
+!tsconfig.json
+!next-env.d.ts
+
+# ── Debug / Test Scripts (project mein nahi chahiye) ───────
+test_*.js
+test_*.ts
+*.test.local.*
+debug_*.js
+
+# ── Temp Files ─────────────────────────────────────────────
+*.tmp
+*.bak
+*.swp

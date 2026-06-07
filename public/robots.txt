@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+Disallow: /adminlohia/
+
+Sitemap: https://lohia-college.ai/sitemap.xml
