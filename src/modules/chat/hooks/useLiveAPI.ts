@@ -65,7 +65,7 @@ function base64ToBuffer(base64: string): Int16Array {
 const DAILY_LIMIT = 40;
 // Voice engine config — fetched from server at runtime
 const LIVE_MODEL = process.env.NEXT_PUBLIC_LC_VOICE_ENGINE || "gemini-live-2.5-flash-native-audio";
-const LIVE_VOICE = process.env.NEXT_PUBLIC_LC_VOICE_PERSONA || "Aoede";
+const LIVE_VOICE = process.env.NEXT_PUBLIC_LC_VOICE_PERSONA || "Kore";
 
 const inferExamDepartment = (text: string) => {
   const lower = text.toLowerCase();
