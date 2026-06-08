@@ -611,6 +611,11 @@ const getCollegeSectionIntents = (text: string) => {
   return keys;
 };
 
+const isInappropriateOrVulgar = (text: string) => {
+  const lower = text.toLowerCase();
+  return /(sexy|hot|gandu|gãndu|saale|salaa|bc\b|mc\b|cotiya|chutiya|bhadwa|saala|randi|gali|gaali|bastard|fuck|asshole|bitch|slut|harami|haramee)/i.test(lower);
+};
+
 const isHarmfulOrViolent = (text: string) => {
   const lower = text.toLowerCase();
   return /(mar dunga|maar dunga|maar doonga|mar doonga|murder|kill|hate|hinsa|à¤¹à¤¿à¤‚à¤¸à¤¾|hatred|attack|nuksan|à¤¨à¥à¤•à¤¸à¤¾à¤¨|harm|hurt)/i.test(lower);
@@ -1189,8 +1194,8 @@ const SYSTEM_PROMPT = `You are "Lohia College AI", a High-Performance Multi-Agen
 - **BSC/MSC MEANING**: If user says BSc, B.Sc, MSc, M.Sc, or misspells science as "scinece", treat it as Science merit records.
 - **SPORTS BROAD MATCHING**: If user asks "football me gold medalist kaun hai" but the matching information is University Colour Holders or winning team records for football, give those football records. Do not answer "no gold medalist" merely because the exact word gold is absent. If no year is given, show all matching sport records; if a year is given, show that year's matching records.
 - **PAST PRINCIPALS**: For year-based principal questions, answer in a polished Markdown table with Name, From, To, and Tenure/Notes. Do NOT use cards for past principals unless the user asks for photo/profile.
-- **SMART SYNTHESIS**: If the exact question is not a direct row (example: "Lohia College dusre college se kaise acha hai"), combine relevant college facts from history, courses, faculty, library, achievements, sports, events, facilities, and FAQs into a sensible answer. Never say information is missing when related facts exist.
-- **MISSING SPECIFIC DETAILS**: If the user asks for a specific detail that is NOT available in our records, respond positively in their language saying something like "Yeh specific jaankari abhi mere paas available nahi hai, hum jaldi hi isko update kar denge, aur aapko turant yeh information mil jayegi!" or similar encouraging message, never apologize unnecessarily.
+- **SMART SYNTHESIS & INDIRECT INFORMATION (CRITICAL)**: If the exact question is not a direct record (e.g., they ask about participating in a specific event/sport or contact a specific staff), but you have indirect or related info (such as general sports achievements, contact numbers of nodal officers, or related departments), do NOT refuse directly. Enthusiastically say something positive in their language (like "Haan, humare college me iska bohot achha scope hai!" or "Iske baare me related jaankari available hai!") and then present that related/indirect information to help them. Never say information is missing when related facts exist.
+- **MISSING SPECIFIC DETAILS**: Only when there is absolutely no direct or indirect information at all, respond positively saying that you don't have the specific update yet but will update it soon, or guide them to check with the college office. Never apologize unnecessarily or say "this is not in the database".
 
 ### UI MARKERS (RAW TEXT, NO BACKTICKS):
 - [[FACULTY_LIST:Department]] (Show ONLY if asked for a list of teachers in a department)
@@ -1338,6 +1343,15 @@ export async function* generateChatResponseStream(
   imageFile?: File,
   profile?: StudentProfile, signal?: AbortSignal): AsyncGenerator<{ text: string; provider?: string }> {
   try {
+    if (isInappropriateOrVulgar(prompt)) {
+      const isEnglish = /^[a-zA-Z0-9\s\?\.\!\,\'\"]+$/.test(prompt) && !/ya|ko|se|me|ke|ki|hai|hain|kya|kaun|kab|kitna|he|gandu|saala|chutiya/i.test(prompt);
+      if (isEnglish) {
+        yield { text: "I'm sorry, but I can only help with requests related to Lohia College. If you have any questions about the college, feel free to ask!" };
+      } else {
+        yield { text: "Maaf kijiye, main keval Lohia College se jude sawalon ke liye hi aapki sahayata kar sakti hoon. Agar aapka college se related koi sawal hai, to kripya poochiye." };
+      }
+      return;
+    }
     // FIX: Fast cache check must happen FIRST — before any DB/async calls
     // BUT SKIP CACHE FOR TOPPER/MERIT QUERIES, NEGATIVE QUERIES, OR HARMFUL QUERIES
     const isMeritQuery = hasMeritIntent(prompt);
