@@ -1385,7 +1385,7 @@ export async function* generateChatResponseStream(
         !isFieldOnlyQuery &&
         (/principal|principal\s*mam|ప్రింసిపల్|ప్రధానాచార్య/i.test(prompt)) &&
         (
-          /who is|kaun hai|kon hai|name kya|kya name|profile|photo|image|details|kya ha|kaise hain/i.test(lowerPrompt) ||
+          /who is|what is|kaun hai|kon hai|name|profile|photo|image|details|kya ha|kaise hain/i.test(lowerPrompt) ||
           // Exact short queries like "principal" or "principal mam"
           lowerPrompt.trim() === "principal" || 
           lowerPrompt.trim() === "principal mam" ||
