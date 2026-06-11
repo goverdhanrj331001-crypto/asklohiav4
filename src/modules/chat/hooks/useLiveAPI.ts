@@ -250,6 +250,11 @@ export function useLiveAPI() {
   const reconnectAttemptsRef = useRef(0);
   const remainingExamsRef = useRef<any[]>([]);
   const isConnectingRef = useRef(false);
+  // Prevents duplicate audio: set true when first audio chunk of a turn arrives,
+  // reset false only when all audio playback ends.
+  const isAIRespondingRef = useRef(false);
+  // Debounce timer for incrementUsage — only count once per actual AI turn
+  const usageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const audioQueueRef = useRef<Int16Array[]>([]);
   const isPlayingRef = useRef(false);
@@ -284,6 +289,7 @@ export function useLiveAPI() {
     nextPlayTimeRef.current = 0;
     audioQueueRef.current = [];
     isPlayingRef.current = false;
+    isAIRespondingRef.current = false;
     setIsSpeaking(false);
   }, []);
 
@@ -333,6 +339,8 @@ export function useLiveAPI() {
         // When a buffer ends, check if there's more to play
         if (audioQueueRef.current.length === 0 && ctx.currentTime >= nextPlayTimeRef.current - 0.05) {
           isPlayingRef.current = false;
+          // All audio for this AI turn has finished playing — allow next turn
+          isAIRespondingRef.current = false;
           setIsSpeaking(false);
         }
       };
@@ -410,6 +418,8 @@ export function useLiveAPI() {
   function stopConnection(closeSession = true) {
     liveConnectionOpenRef.current = false;
     isConnectingRef.current = false;
+    isAIRespondingRef.current = false;
+    if (usageTimerRef.current) { clearTimeout(usageTimerRef.current); usageTimerRef.current = null; }
     setIsConnected(false);
     setIsSpeaking(false);
     stopAllAudio();
@@ -761,7 +771,10 @@ ${contextInfo}`;
             const message: LiveServerMessage = msg.payload;
 
             if (message.serverContent?.interrupted) {
+              // User interrupted AI — stop all audio and reset responding state
               stopAllAudio();
+              isAIRespondingRef.current = false;
+              if (usageTimerRef.current) { clearTimeout(usageTimerRef.current); usageTimerRef.current = null; }
             }
 
             const inputText = message.serverContent?.inputTranscription?.text?.trim();
@@ -950,7 +963,12 @@ ${contextInfo}`;
             }
 
             if (message.serverContent?.turnComplete) {
-              incrementUsage();
+              // Debounce: only count once per AI turn, even if multiple turnComplete events arrive
+              if (usageTimerRef.current) clearTimeout(usageTimerRef.current);
+              usageTimerRef.current = setTimeout(() => {
+                usageTimerRef.current = null;
+                incrementUsage();
+              }, 1500);
             }
 
             if (message.toolCall && message.toolCall.functionCalls) {
@@ -1123,9 +1141,21 @@ ${contextInfo}`;
             const parts = message.serverContent?.modelTurn?.parts;
             const base64Audio = (parts && parts.length > 0) ? parts.find((p: any) => p.inlineData)?.inlineData?.data : undefined;
             if (base64Audio) {
-              const pcm16 = base64ToBuffer(base64Audio);
-              audioQueueRef.current.push(pcm16);
-              processAudioQueue();
+              // Guard: if AI was already done responding (isAIRespondingRef is false AND
+              // it's a fresh turnComplete already counted), skip duplicate audio from
+              // a second/ghost response cycle.
+              // We only skip if audio is already playing AND this appears to be a new
+              // redundant turn (i.e., the queue was already cleared/empty before this chunk).
+              if (!isAIRespondingRef.current && isPlayingRef.current) {
+                // A new audio chunk arrived while AI was already speaking from a previous
+                // turn — this is a duplicate. Discard it.
+                console.warn('[LiveAPI] Discarding duplicate audio chunk — AI already responding.');
+              } else {
+                isAIRespondingRef.current = true;
+                const pcm16 = base64ToBuffer(base64Audio);
+                audioQueueRef.current.push(pcm16);
+                processAudioQueue();
+              }
             }
           }
         };
