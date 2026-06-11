@@ -14,20 +14,35 @@ import {
   searchCourses, searchKnowledgeBase, searchKnowledgeItems, searchMaterialsChat, searchAlertsChat, searchSports
 } from '../services/collegeDataService';
 
+// ─── FIX 1a: Fingerprint ko module level pe preload karo ───────────────────────
+// Pehle ye dynamic import startConnection() ke time pe hota tha — connection slow hota tha.
+// Ab module load hote hi warm-up shuru ho jaata hai.
 let cachedFingerprint: string | null = null;
-const getFingerprint = async () => {
+let fingerprintLoadPromise: Promise<string> | null = null;
+
+const getFingerprint = async (): Promise<string> => {
   if (cachedFingerprint) return cachedFingerprint;
-  try {
-    const fpPromise = await import('@fingerprintjs/fingerprintjs');
-    const fp = await fpPromise.load();
-    const result = await fp.get();
-    cachedFingerprint = result.visitorId;
-    return cachedFingerprint;
-  } catch (e) {
-    console.warn("Fingerprint failed, fallback to local ID", e);
-    return 'fallback_id_123';
-  }
+  if (fingerprintLoadPromise) return fingerprintLoadPromise;
+  fingerprintLoadPromise = (async () => {
+    try {
+      const fpPromise = await import('@fingerprintjs/fingerprintjs');
+      const fp = await fpPromise.load();
+      const result = await fp.get();
+      cachedFingerprint = result.visitorId;
+      return cachedFingerprint;
+    } catch (e) {
+      console.warn("Fingerprint failed, fallback to local ID", e);
+      cachedFingerprint = 'fallback_id_123';
+      return cachedFingerprint;
+    } finally {
+      fingerprintLoadPromise = null;
+    }
+  })();
+  return fingerprintLoadPromise;
 };
+
+// Module load hote hi fingerprint warm karo — startConnection() tak wait mat karo
+getFingerprint();
 
 
 // Utility to convert Float32Array (from getUserMedia) to Int16Array (for Gemini)
@@ -242,7 +257,7 @@ export function useLiveAPI() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<any>(null);
-  const sessionRef = useRef<any>(null); // To store the live session
+  const sessionRef = useRef<any>(null);
   const liveConnectionOpenRef = useRef(false);
   const examContextRef = useRef('');
   const examFlowStepRef = useRef(0);
@@ -250,9 +265,16 @@ export function useLiveAPI() {
   const reconnectAttemptsRef = useRef(0);
   const remainingExamsRef = useRef<any[]>([]);
   const isConnectingRef = useRef(false);
-  // Prevents duplicate audio: set true when first audio chunk of a turn arrives,
-  // reset false only when all audio playback ends.
+
+  // ─── FIX 3a: Pending audio chunks counter ────────────────────────────────────
+  // Pehle: pehla buffer khatam hote hi isAIRespondingRef = false ho jaata tha,
+  // aur agli chunks "duplicate" samajh ke discard ho jaati thin — awaaz cut hoti thi.
+  // Ab: jab tak saare pending chunks queue mein aa nahi jaate, responding = true rahega.
+  const pendingAudioChunksRef = useRef(0);
+
+  // Prevents duplicate audio from a genuinely new ghost turn (not network delay)
   const isAIRespondingRef = useRef(false);
+
   // Debounce timer for incrementUsage — only count once per actual AI turn
   const usageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -261,8 +283,14 @@ export function useLiveAPI() {
   const nextPlayTimeRef = useRef(0);
   const activeSourceNodesRef = useRef<AudioBufferSourceNode[]>([]);
 
-  // WebSocket proxy reference (replaces GoogleGenAI session)
+  // WebSocket proxy reference
   const proxyWsRef = useRef<WebSocket | null>(null);
+
+  // ─── FIX 2a: Exam-handled-by-transcript flag ─────────────────────────────────
+  // Pehle: inputTranscription handler aur toolCall handler dono ek hi exam query
+  // handle kar lete the — AI do baar same jawab bolti thi.
+  // Ab: transcription handler ne agar exam handle kar diya, toolCall handler skip karega.
+  const examHandledByTranscriptRef = useRef(false);
 
   // Helper: send message to proxy server
   const proxySend = useCallback((obj: object) => {
@@ -289,6 +317,8 @@ export function useLiveAPI() {
     nextPlayTimeRef.current = 0;
     audioQueueRef.current = [];
     isPlayingRef.current = false;
+    // ─── FIX 3b: pendingAudioChunks bhi reset karo ───────────────────────────
+    pendingAudioChunksRef.current = 0;
     isAIRespondingRef.current = false;
     setIsSpeaking(false);
   }, []);
@@ -313,42 +343,40 @@ export function useLiveAPI() {
       source.buffer = buffer;
       source.connect(ctx.destination);
 
-      // Improved Scheduling Logic:
-      // 1. If we are starting fresh or lagged behind, start with a tiny 100ms lookahead
-      // 2. Otherwise, chain it exactly after the previous buffer
+      // Scheduling: fresh start ya lag — 100ms lookahead, otherwise chain exactly
       let startTime = nextPlayTimeRef.current;
       const now = ctx.currentTime;
-
       if (startTime < now) {
-        // Either starting fresh or we lagged. Add 100ms buffer to prevent immediate stutter.
         startTime = now + 0.1;
       }
 
       source.start(startTime);
       nextPlayTimeRef.current = startTime + buffer.duration;
-
       activeSourceNodesRef.current.push(source);
-
       isPlayingRef.current = true;
       setIsSpeaking(true);
 
       source.onended = () => {
-        // Remove from active nodes
         activeSourceNodesRef.current = activeSourceNodesRef.current.filter(n => n !== source);
 
-        // When a buffer ends, check if there's more to play
-        if (audioQueueRef.current.length === 0 && ctx.currentTime >= nextPlayTimeRef.current - 0.05) {
+        // ─── FIX 3c: Sirf tab reset karo jab sab kuch khatam ho ──────────────
+        // Pehle: pehla buffer khatam = isAIResponding false = agli valid chunks discard
+        // Ab: pending chunks counter check karo — agar aur bhi aa rahe hain, wait karo
+        pendingAudioChunksRef.current = Math.max(0, pendingAudioChunksRef.current - 1);
+
+        const queueEmpty = audioQueueRef.current.length === 0;
+        const noActiveNodes = activeSourceNodesRef.current.length === 0;
+        const noPendingChunks = pendingAudioChunksRef.current === 0;
+        const audioTimeReached = ctx.currentTime >= nextPlayTimeRef.current - 0.05;
+
+        if (queueEmpty && noActiveNodes && noPendingChunks && audioTimeReached) {
           isPlayingRef.current = false;
-          // All audio for this AI turn has finished playing — allow next turn
           isAIRespondingRef.current = false;
           setIsSpeaking(false);
         }
       };
     }
   }, []);
-
-  // Removed processAudioQueueRef.current and useEffect for processAudioQueue
-  // since we'll call it directly from onmessage.
 
   const [dailyLimitReached, setDailyLimitReached] = useState(false);
   const [questionsRemaining, setQuestionsRemaining] = useState(DAILY_LIMIT);
@@ -392,7 +420,6 @@ export function useLiveAPI() {
               setTimeUntilReset(null);
             }
           } else {
-            // Not limited yet
             setQuestionsRemaining(Math.max(0, DAILY_LIMIT - (data.question_count || 0)));
             setDailyLimitReached(false);
             setTimeUntilReset(null);
@@ -419,6 +446,7 @@ export function useLiveAPI() {
     liveConnectionOpenRef.current = false;
     isConnectingRef.current = false;
     isAIRespondingRef.current = false;
+    examHandledByTranscriptRef.current = false;
     if (usageTimerRef.current) { clearTimeout(usageTimerRef.current); usageTimerRef.current = null; }
     setIsConnected(false);
     setIsSpeaking(false);
@@ -450,7 +478,6 @@ export function useLiveAPI() {
       proxyWsRef.current = null;
     }
 
-    // Legacy sessionRef cleanup (no longer used but kept for safety)
     if (closeSession && sessionRef.current) {
       sessionRef.current = null;
     }
@@ -512,23 +539,94 @@ export function useLiveAPI() {
       remainingExamsRef.current = [];
       examFlowStepRef.current = 0;
       examContextRef.current = '';
+      examHandledByTranscriptRef.current = false;
 
       const apiKey = process.env.NEXT_PUBLIC_LOHIA_COLLEGE_VOICE_KEY;
       // Note: apiKey check removed — Vertex AI uses Service Account on server side
 
-      // Fetch dynamic college comprehensive context
-      let contextInfo = "College Name: Lohia College.\\n";
-      try {
-        const res = await fetch('/api/chat/live-context');
-        if (res.ok) {
-          const data = await res.json();
-          if (data.context) {
-            contextInfo = data.context;
+      // ─── FIX 1b: Context fetch aur AudioContext+Mic setup PARALLEL chalao ───
+      // Pehle: context fetch → phir mic setup → phir WebSocket — sab sequential tha.
+      // Ab: dono ek saath chalte hain, jo bhi pehle khatam ho.
+      let contextInfo = "College Name: Lohia College.\n";
+
+      const [contextResult, audioSetupResult] = await Promise.allSettled([
+        // Task 1: College context fetch
+        (async () => {
+          const res = await fetch('/api/chat/live-context');
+          if (res.ok) {
+            const data = await res.json();
+            if (data.context) return data.context;
           }
-        }
-      } catch {
+          return null;
+        })(),
+        // Task 2: AudioContext + Mic setup
+        (async () => {
+          const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+          audioContextRef.current = ctx;
+
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
+          streamRef.current = stream;
+
+          const source = ctx.createMediaStreamSource(stream);
+
+          const workletCode = `
+          class PCMProcessor extends AudioWorkletProcessor {
+            constructor() {
+              super();
+              // 2048 samples @ 16kHz = ~128ms per chunk
+              this.bufferSize = 2048;
+              this.buffer = new Float32Array(this.bufferSize);
+              this.framesWritten = 0;
+            }
+            process(inputs, outputs, parameters) {
+              const input = inputs[0];
+              if (input && input.length > 0) {
+                const channelData = input[0];
+                for (let i = 0; i < channelData.length; i++) {
+                  this.buffer[this.framesWritten++] = channelData[i];
+                  if (this.framesWritten >= this.bufferSize) {
+                    this.port.postMessage(this.buffer.slice(0));
+                    this.buffer = new Float32Array(this.bufferSize);
+                    this.framesWritten = 0;
+                  }
+                }
+              }
+              return true;
+            }
+          }
+          registerProcessor('pcm-processor', PCMProcessor);
+          `;
+          const blob = new Blob([workletCode], { type: 'application/javascript' });
+          const workletUrl = URL.createObjectURL(blob);
+          await ctx.audioWorklet.addModule(workletUrl);
+
+          const processor = new AudioWorkletNode(ctx, 'pcm-processor');
+          processorRef.current = processor;
+          source.connect(processor);
+          // Do NOT connect processor to destination — mic echo feedback hoga
+          return { ctx, processor };
+        })()
+      ]);
+
+      // Context result handle karo
+      if (contextResult.status === 'fulfilled' && contextResult.value) {
+        contextInfo = contextResult.value;
+      } else {
         console.warn('Lohia AI: Could not fetch college context, using fallback.');
       }
+
+      // Audio setup fail hua? Error throw karo
+      if (audioSetupResult.status === 'rejected') {
+        throw audioSetupResult.reason;
+      }
+
+      const { processor } = audioSetupResult.value as { ctx: AudioContext; processor: AudioWorkletNode };
 
       const dynamicSystemInstruction = `You are the Official Lohia College AI Assistant. You are a highly professional, intelligent, and helpful YOUNG INDIAN FEMALE representation of the college.
       
@@ -585,69 +683,8 @@ INTERACTION FLOW:
 ${contextInfo}`;
 
       // ================================================================
-      // AudioContext + Microphone Setup (must be before WebSocket proxy)
-      // ================================================================
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      audioContextRef.current = ctx;
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      });
-      streamRef.current = stream;
-
-      const source = ctx.createMediaStreamSource(stream);
-
-      const workletCode = `
-      class PCMProcessor extends AudioWorkletProcessor {
-        constructor() {
-          super();
-          // 2048 samples @ 16kHz = ~128ms per chunk (was 4096=256ms)
-          // Smaller buffer = AI hears user faster, less latency
-          this.bufferSize = 2048;
-          this.buffer = new Float32Array(this.bufferSize);
-          this.framesWritten = 0;
-        }
-        process(inputs, outputs, parameters) {
-          const input = inputs[0];
-          if (input && input.length > 0) {
-            const channelData = input[0];
-            for (let i = 0; i < channelData.length; i++) {
-              this.buffer[this.framesWritten++] = channelData[i];
-              if (this.framesWritten >= this.bufferSize) {
-                // Send a COPY of the buffer — never send the same reference
-                // that will be overwritten on the next iteration
-                this.port.postMessage(this.buffer.slice(0));
-                this.buffer = new Float32Array(this.bufferSize);
-                this.framesWritten = 0;
-              }
-            }
-          }
-          return true;
-        }
-      }
-      registerProcessor('pcm-processor', PCMProcessor);
-      `;
-      const blob = new Blob([workletCode], { type: 'application/javascript' });
-      const workletUrl = URL.createObjectURL(blob);
-      await ctx.audioWorklet.addModule(workletUrl);
-
-      const processor = new AudioWorkletNode(ctx, 'pcm-processor');
-      processorRef.current = processor;
-
-      source.connect(processor);
-      // Do NOT connect processor to destination — that would cause microphone echo feedback
-      // processor.connect(ctx.destination);
-
-      // ================================================================
       // Vertex AI WebSocket Proxy Connection
-      // Server.js pe connect karo jo Vertex AI se baat karta hai
       // ================================================================
-      // Production mein: wss://voice.asklohia.online (standalone backend)
-      // Local dev mein: ws://localhost:3000/api/live-proxy (same-host fallback)
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const voiceBackendUrl =
         process.env.NEXT_PUBLIC_VOICE_BACKEND_WS_URL ||
@@ -659,7 +696,6 @@ ${contextInfo}`;
         proxyWs.onopen = () => {
           console.log('[LiveAPI] Proxy WebSocket connected, sending setup...');
 
-          // ---- Setup message: server ko model + config bhejo ----
           proxyWs.send(JSON.stringify({
             type: 'setup',
             model: LIVE_MODEL,
@@ -668,7 +704,6 @@ ${contextInfo}`;
               speechConfig: {
                 voiceConfig: { prebuiltVoiceConfig: { voiceName: LIVE_VOICE } },
               },
-
               tools: [
                 { functionDeclarations: [
                   facultySearchTool, principalTool, collegeSectionsTool, pastPrincipalsTool,
@@ -701,7 +736,7 @@ ${contextInfo}`;
             liveConnectionOpenRef.current = true;
             reconnectAttemptsRef.current = 0;
             setIsConnected(true);
-            resolve(proxyWs); // session ready
+            resolve(proxyWs);
 
             // Initial greeting
             setTimeout(() => {
@@ -712,7 +747,7 @@ ${contextInfo}`;
               }));
             }, 500);
 
-            // Audio capture shuru karo
+            // Audio capture start
             processor.port.onmessage = (e) => {
               if (!liveConnectionOpenRef.current) return;
               const inputData = e.data;
@@ -722,8 +757,6 @@ ${contextInfo}`;
               if (proxyWs.readyState === WebSocket.OPEN) {
                 proxyWs.send(JSON.stringify({
                   type: 'realtimeInput',
-                  // Vertex AI Live API requires exactly 'audio/pcm' — 16kHz s16le mono
-                  // The AudioContext is created with sampleRate: 16000, so format matches
                   data: { audio: { data: base64Data, mimeType: 'audio/pcm' } }
                 }));
               }
@@ -771,15 +804,19 @@ ${contextInfo}`;
             const message: LiveServerMessage = msg.payload;
 
             if (message.serverContent?.interrupted) {
-              // User interrupted AI — stop all audio and reset responding state
+              // User interrupted AI — stop audio, reset flags
               stopAllAudio();
               isAIRespondingRef.current = false;
+              examHandledByTranscriptRef.current = false;
               if (usageTimerRef.current) { clearTimeout(usageTimerRef.current); usageTimerRef.current = null; }
             }
 
             const inputText = message.serverContent?.inputTranscription?.text?.trim();
 
             if (message.serverContent?.inputTranscription?.finished && inputText) {
+              // Reset exam-handled flag at the start of each new user turn
+              examHandledByTranscriptRef.current = false;
+
               // Check if we are waiting for confirmation of remaining exams
               if (remainingExamsRef.current && remainingExamsRef.current.length > 0 && isAffirmative(inputText)) {
                 const chunk = remainingExamsRef.current.slice(0, 5);
@@ -798,7 +835,10 @@ ${contextInfo}`;
                   examContextRef.current = '';
                 }
 
-                stopAllAudio();
+                // ─── FIX 2b: stopAllAudio sirf user interrupt pe — auto-flow pe nahi ──
+                // Pehle: har proxyWs.send se pehle stopAllAudio() tha — mid-sentence cut
+                // Ab: yahan AI khud se aage bol rahi hai, audio interrupt mat karo
+                examHandledByTranscriptRef.current = true;
                 proxyWs.send(JSON.stringify({
                   type: 'clientContent',
                   data: {
@@ -891,7 +931,7 @@ ${contextInfo}`;
 
                             answer = `${heading} ke papers ye hain: ${lines.join('. ')}.`;
                             if (missingSubjects.length > 0) {
-                              answer += ` Lekin hamare paas ${missingSubjects.join(', ')} ke papers ki detail database mein record maujood nahi hai.`;
+                              answer += ` Lekin hamare paas ${missingSubjects.join(', ')} ke papers ki detail available nahi hai.`;
                             }
                             if (hasMore) {
                               answer += ` Aapne jo aur paper bole the, kya aap unke baare mein bhi jaanna chahte hain?`;
@@ -899,7 +939,7 @@ ${contextInfo}`;
                             shouldSend = true;
                             examFlowStepRef.current = 0;
                           } else {
-                            answer = `Hamare paas ${missingSubjects.join(', ')} ke papers ki detail database mein record maujood nahi hai.`;
+                            answer = `Hamare paas ${missingSubjects.join(', ')} ke papers ki detail available nahi hai.`;
                             remainingExamsRef.current = [];
                             shouldSend = true;
                             examFlowStepRef.current = 0;
@@ -930,7 +970,7 @@ ${contextInfo}`;
                             shouldSend = true;
                             examFlowStepRef.current = 0;
                           } else {
-                            answer = 'Maaf kijiye, hamare paas ye database mein record maujood nahi hai.';
+                            answer = 'Maaf kijiye, hamare paas ye jankari abhi available nahi hai.';
                             remainingExamsRef.current = [];
                             shouldSend = true;
                             examFlowStepRef.current = 0;
@@ -941,7 +981,9 @@ ${contextInfo}`;
 
                     if (shouldSend) {
                       lastExamAnswerKeyRef.current = answerKey;
-                      stopAllAudio();
+                      // ─── FIX 2c: examHandledByTranscriptRef set karo BEFORE send ─────
+                      // toolCall handler isko check karega — agar true hai to skip karega
+                      examHandledByTranscriptRef.current = true;
                       proxyWs.send(JSON.stringify({
                         type: 'clientContent',
                         data: {
@@ -953,6 +995,7 @@ ${contextInfo}`;
                   } catch (err) {
                     console.error('Live deterministic exam answer failed:', err);
                     const fallback = 'Maaf kijiye, is exam schedule ka exact record abhi available information me nahi mila. Kripya course, semester, status aur subject clear bata dein, main help kar dungi.';
+                    examHandledByTranscriptRef.current = true;
                     proxyWs.send(JSON.stringify({
                       type: 'clientContent',
                       data: { turns: fallback, turnComplete: true }
@@ -963,7 +1006,7 @@ ${contextInfo}`;
             }
 
             if (message.serverContent?.turnComplete) {
-              // Debounce: only count once per AI turn, even if multiple turnComplete events arrive
+              // Debounce: only count once per AI turn
               if (usageTimerRef.current) clearTimeout(usageTimerRef.current);
               usageTimerRef.current = setTimeout(() => {
                 usageTimerRef.current = null;
@@ -985,6 +1028,15 @@ ${contextInfo}`;
                     case 'get_achievements': result = await getAllAchievements((call.args as any).query); break;
                     case 'search_merit_list': result = await searchMeritList(call.args as any); break;
                     case 'search_main_exams': {
+                      // ─── FIX 2d: Transcript ne already handle kar diya? Skip karo ──────
+                      // Pehle: dono paths fire hote the — AI same jawab 2 baar bolti thi
+                      // Ab: agar transcription handler ne pehle se bhej diya hai, skip
+                      if (examHandledByTranscriptRef.current) {
+                        console.log('[LiveAPI] search_main_exams: already handled by transcript handler, skipping toolCall path.');
+                        result = { skipped: true, reason: 'Handled by transcript handler' };
+                        break;
+                      }
+
                       const args = call.args || {};
                       let { status, level, semester, subject, department, query } = args as any;
 
@@ -1071,10 +1123,10 @@ ${contextInfo}`;
                           else remainingExamsRef.current = [];
                           const lines = rowsToShow.map((row: any) => `${row.subject || 'Subject'} ${row.paper || 'paper'}: ${formatDateForVoice(row.exam_date)}, ${formatTimeForVoice(row.exam_time)}`);
                           answer = `${heading} ke papers ye hain: ${lines.join('. ')}.`;
-                          if (missingSubjects.length > 0) answer += ` Lekin hamare paas ${missingSubjects.join(', ')} ke papers ki detail database mein record maujood nahi hai.`;
+                          if (missingSubjects.length > 0) answer += ` Lekin hamare paas ${missingSubjects.join(', ')} ke papers ki detail available nahi hai.`;
                           if (hasMore) answer += ` Aapne jo aur paper bole the, kya aap unke baare mein bhi jaanna chahte hain?`;
                         } else {
-                          answer = `Hamare paas ${missingSubjects.join(', ')} ke papers ki detail database mein record maujood nahi hai.`;
+                          answer = `Hamare paas ${missingSubjects.join(', ')} ke papers ki detail available nahi hai.`;
                           remainingExamsRef.current = [];
                         }
                       } else {
@@ -1090,7 +1142,7 @@ ${contextInfo}`;
                           answer = `${heading} ke sabhi papers ye hain: ${lines.join('. ')}.`;
                           if (hasMore) answer += ` Aapne jo aur paper bole the, kya aap unke baare mein bhi jaanna chahte hain?`;
                         } else {
-                          answer = 'Maaf kijiye, hamare paas ye database mein record maujood nahi hai.';
+                          answer = 'Maaf kijiye, hamare paas ye jankari abhi available nahi hai.';
                           remainingExamsRef.current = [];
                         }
                       }
@@ -1141,17 +1193,19 @@ ${contextInfo}`;
             const parts = message.serverContent?.modelTurn?.parts;
             const base64Audio = (parts && parts.length > 0) ? parts.find((p: any) => p.inlineData)?.inlineData?.data : undefined;
             if (base64Audio) {
-              // Guard: if AI was already done responding (isAIRespondingRef is false AND
-              // it's a fresh turnComplete already counted), skip duplicate audio from
-              // a second/ghost response cycle.
-              // We only skip if audio is already playing AND this appears to be a new
-              // redundant turn (i.e., the queue was already cleared/empty before this chunk).
-              if (!isAIRespondingRef.current && isPlayingRef.current) {
-                // A new audio chunk arrived while AI was already speaking from a previous
-                // turn — this is a duplicate. Discard it.
-                console.warn('[LiveAPI] Discarding duplicate audio chunk — AI already responding.');
+              // ─── FIX 3d: pendingAudioChunks counter + correct duplicate detection ──
+              // Pehle: isAIRespondingRef false + isPlayingRef true = duplicate assume karo
+              //        Problem: network delay se pehla buffer khatam, dusra abhi aaya nahi
+              //        isAIRespondingRef = false ho jaata tha, agli valid chunk discard hoti thi
+              // Ab: pendingAudioChunksRef se track karo — agar chunks active hain to
+              //     sirf tabhi discard karo jab genuinely ek naya ghost turn aa raha ho
+              if (isAIRespondingRef.current && isPlayingRef.current && pendingAudioChunksRef.current === 0) {
+                // Queue empty hai aur koi active node nahi, lekin isAIResponding true hai —
+                // ye genuinely ek naya duplicate turn hai, discard karo
+                console.warn('[LiveAPI] Discarding duplicate audio chunk — ghost turn detected.');
               } else {
                 isAIRespondingRef.current = true;
+                pendingAudioChunksRef.current += 1;
                 const pcm16 = base64ToBuffer(base64Audio);
                 audioQueueRef.current.push(pcm16);
                 processAudioQueue();
@@ -1179,7 +1233,6 @@ ${contextInfo}`;
       });
 
       sessionRef.current = sessionPromise;
-
 
     } catch (err: any) {
       console.error(err);
