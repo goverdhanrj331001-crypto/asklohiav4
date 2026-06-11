@@ -249,6 +249,7 @@ export function useLiveAPI() {
   const lastExamAnswerKeyRef = useRef('');
   const reconnectAttemptsRef = useRef(0);
   const remainingExamsRef = useRef<any[]>([]);
+  const isConnectingRef = useRef(false);
 
   const audioQueueRef = useRef<Int16Array[]>([]);
   const isPlayingRef = useRef(false);
@@ -408,6 +409,7 @@ export function useLiveAPI() {
 
   function stopConnection(closeSession = true) {
     liveConnectionOpenRef.current = false;
+    isConnectingRef.current = false;
     setIsConnected(false);
     setIsSpeaking(false);
     stopAllAudio();
@@ -490,6 +492,11 @@ export function useLiveAPI() {
       setError(`Daily limit of ${DAILY_LIMIT} questions reached.`);
       return;
     }
+    if (isConnectingRef.current || liveConnectionOpenRef.current || proxyWsRef.current) {
+      console.warn('[LiveAPI] Connection already in progress or established. Ignoring second call.');
+      return;
+    }
+    isConnectingRef.current = true;
     try {
       setError(null);
       remainingExamsRef.current = [];
