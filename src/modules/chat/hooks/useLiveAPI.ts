@@ -698,10 +698,6 @@ ${contextInfo}`;
             // Audio capture shuru karo
             processor.port.onmessage = (e) => {
               if (!liveConnectionOpenRef.current) return;
-              
-              // Prevent echo/barge-in interruption: skip sending mic input while AI is speaking
-              if (isPlayingRef.current) return;
-
               const inputData = e.data;
               const pcm16 = floatTo16BitPCM(inputData);
               const base64Data = bufferToBase64(pcm16);
